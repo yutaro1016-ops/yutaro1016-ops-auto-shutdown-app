@@ -27,9 +27,9 @@ class FakeRunner:
                 return scheduler.CommandResult(1)
             self.exists = False
             return scheduler.CommandResult(0)
-        if "/Create" in args:
+        if args and args[0].lower() == "powershell.exe":
             if self.fail_create:
-                return scheduler.CommandResult(1)
+                return scheduler.CommandResult(1, stderr="registration failed")
             self.exists = True
             return scheduler.CommandResult(0)
         return scheduler.CommandResult(1)
@@ -51,7 +51,7 @@ def test_t3_existing_reservation_replaced():
     scheduler.schedule_shutdown(target, False, runner=fake)
     assert fake.exists is True
     assert sum("/Delete" in c for c in fake.calls) == 1
-    assert sum("/Create" in c for c in fake.calls) == 1
+    assert sum(c and c[0].lower() == "powershell.exe" for c in fake.calls) == 1
 
 
 def test_t4_cancel():
@@ -74,9 +74,24 @@ def test_force_flag_default_command_is_safe():
     assert scheduler.build_shutdown_command(True).endswith(" /f")
 
 
-def test_create_args_are_argument_list_not_shell_string():
-    target = datetime(2026, 10, 13, 22, 30)
+def test_create_args_are_locale_independent_and_not_shell_string():
+    target = datetime(2026, 10, 14, 1, 56)
     args = scheduler.build_create_args(target, False)
-    assert args[0] == "schtasks.exe"
-    assert "/TN" in args and scheduler.TASK_NAME in args
-    assert "22:30" in args
+    assert args[0] == "powershell.exe"
+    assert "-Command" in args
+    script = args[-1]
+    assert "2026-10-14T01:56:00" in script
+    assert "InvariantCulture" in script
+    assert "shutdown.exe" in script
+    assert "/s /t 0" in script
+    assert "10/14/2026" not in script
+
+
+def test_create_failure_surfaces_detail():
+    fake = FakeRunner(fail_create=True)
+    try:
+        scheduler.schedule_shutdown(datetime(2026, 10, 14, 1, 56), False, runner=fake)
+    except scheduler.SchedulerError as exc:
+        assert "registration failed" in str(exc)
+    else:
+        raise AssertionError("create failure should raise SchedulerError")
