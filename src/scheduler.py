@@ -40,25 +40,35 @@ def resolve_target(now: datetime, hour: int | str, minute: int | str) -> datetim
 
 
 def build_shutdown_command(force_close: bool) -> str:
-    # /f can cause unsaved work to be lost. It is opt-in only.
     return "shutdown.exe /s /t 0 /f" if force_close else "shutdown.exe /s /t 0"
 
 
 def build_create_args(target: datetime, force_close: bool) -> list[str]:
+    # Use PowerShell ScheduledTasks cmdlets instead of schtasks /SD because
+    # schtasks date parsing follows the Windows locale. This caused registration
+    # failures on Japanese Windows when an MM/DD/YYYY date was supplied.
+    iso_target = target.strftime("%Y-%m-%dT%H:%M:%S")
+    action_args = "/s /t 0 /f" if force_close else "/s /t 0"
+    safe_task_name = TASK_NAME.replace("'", "''")
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$when=[datetime]::ParseExact('{iso_target}','yyyy-MM-ddTHH:mm:ss',"
+        "[System.Globalization.CultureInfo]::InvariantCulture);"
+        f"$action=New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument '{action_args}';"
+        "$trigger=New-ScheduledTaskTrigger -Once -At $when;"
+        "$principal=New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) "
+        "-LogonType Interactive -RunLevel Limited;"
+        f"Register-ScheduledTask -TaskName '{safe_task_name}' -Action $action -Trigger $trigger "
+        "-Principal $principal -Force | Out-Null"
+    )
     return [
-        "schtasks.exe",
-        "/Create",
-        "/TN",
-        TASK_NAME,
-        "/SC",
-        "ONCE",
-        "/SD",
-        target.strftime("%m/%d/%Y"),
-        "/ST",
-        target.strftime("%H:%M"),
-        "/TR",
-        build_shutdown_command(force_close),
-        "/F",
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
     ]
 
 
@@ -98,13 +108,10 @@ def cancel_shutdown(runner=_run) -> bool:
     result = runner(build_delete_args())
     if result.returncode == 0:
         return True
-    # Deleting a missing task is treated as an already-cancelled state.
     return not task_exists(runner)
 
 
 def schedule_shutdown(target: datetime, force_close: bool, runner=_run) -> None:
-    # Explicitly remove an old reservation first; /F would replace it as well,
-    # but deletion makes the one-task invariant easier to reason about.
     if task_exists(runner):
         deleted = runner(build_delete_args())
         if deleted.returncode != 0:
@@ -112,6 +119,9 @@ def schedule_shutdown(target: datetime, force_close: bool, runner=_run) -> None:
 
     created = runner(build_create_args(target, force_close))
     if created.returncode != 0:
+        detail = (created.stderr or created.stdout).strip()
+        if detail:
+            raise SchedulerError(f"シャットダウン予約をWindowsに登録できませんでした。詳細: {detail}")
         raise SchedulerError("シャットダウン予約をWindowsに登録できませんでした。")
 
     if not task_exists(runner):
